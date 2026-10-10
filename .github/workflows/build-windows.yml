@@ -219,25 +219,79 @@ jobs:
         shell: pwsh
         run: choco install ccache -y --no-progress
 
-      # 缓存目录自己管：CCACHE_DIR 在下面 conf/config.sh 里固定成 C:\ccache，
-      # 这里用官方 actions/cache 存取。之前用 hendrikmuhs/ccache-action，
-      # 两次运行恢复缓存都报 400（Failed to restore: Cache service responded with 400），
-      # 导致每次都全量编译 2 小时+。
+      # 缓存目录自己管：CCACHE_DIR 固定成 C:/ccache，这里用官方 actions/cache 存取。
+      # 之前用 hendrikmuhs/ccache-action，两次运行恢复缓存都报 400
+      #（Failed to restore: Cache service responded with 400），导致每次都全量编译 2 小时+。
       - name: 恢复 ccache 编译缓存
         uses: actions/cache@v4
         with:
           path: C:\ccache
-          key: coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-v2
+          key: coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-v3
           restore-keys: |
             coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-
             coa-ccache-win-
+
+      # ★ 必须有这一步：actions/cache 在【缓存未命中】时不会创建 C:\ccache，
+      #   而 ccache 第一次运行时也不会自己把目录树建全，于是第一个文件开始编译就报
+      #     ccache: error: Failed to write to C:/ccache/cache.debug: No such file or directory
+      #   由于 ccache 是 CMAKE_*_COMPILER_LAUNCHER，它一挂整个 ninja 就停 —— exit 1。
+      #   （第一次跑、或换了 core_ref/module_ref 导致 key 变了，必然是未命中，所以必踩。）
+      #   做法：自己建目录 + 探一次可写性 + 让 ccache 真正初始化一遍；
+      #   只要有任何一步不过，就把 ccache 关掉继续编译，绝不为了一个缓存废掉 2 小时的构建。
+      - name: 准备 ccache 目录并自检
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = 'C:/ccache'
+
+          New-Item -ItemType Directory -Force -Path $dir          | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dir/tmp"    | Out-Null
+
+          # 先自己试写一下，确认这个目录真的可写
+          $probe = "$dir/.write-probe"
+          Set-Content -Path $probe -Value 'ok' -Encoding ascii
+          Remove-Item $probe -Force -ErrorAction Stop
+          Write-Host "目录可写: $dir"
+
+          # 传给后面的 bash 步骤（acore.sh 读 CCACHE_DIR）
+          "CCACHE_DIR=$dir"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CCACHE_TEMPDIR=$dir/tmp"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CCACHE_MAXSIZE=2G"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $env:CCACHE_DIR     = $dir
+          $env:CCACHE_TEMPDIR = "$dir/tmp"
+
+          Write-Host "ccache: $((& ccache --version 2>&1 | Select-Object -First 1))"
+
+          # 让 ccache 自己初始化（写 stats / tmp），这就是之前失败的那一下。
+          # 这里失败也不 throw，只是降级成"不用 ccache"继续编译。
+          $ok = $true
+          try {
+            $out = & ccache -z 2>&1
+            $out | Write-Host
+            if ($LASTEXITCODE -ne 0) { $ok = $false }
+          } catch {
+            Write-Warning "ccache -z 抛异常: $_"
+            $ok = $false
+          }
+
+          if (-not $ok) {
+            Write-Warning 'ccache 初始化失败，本次编译改用 AC_CCACHE=false（只是慢，不影响出包）'
+            'COA_CCACHE=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            & ccache -s 2>&1 | Select-Object -First 12 | Write-Host
+            'COA_CCACHE=true' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host 'ccache 初始化成功，缓存目录 C:/ccache'
+          }
 
       - name: 写入 acore.sh 编译配置 conf/config.sh
         shell: bash
         working-directory: C:\ac
         run: |
           mkdir -p conf
-          cat > conf/config.sh <<EOF
+          # 注意 <<'EOF' 用引号：里面的 ${...} 要原样留给 acore.sh source 时再展开，
+          # 不要在这一步就被替换掉。${{ }} 那两处是 GitHub 在传给 bash 之前就替换好的，不受影响。
+          cat > conf/config.sh <<'EOF'
           # 由 GitHub Actions 生成
 
           # ★ 必须显式写成 Windows 风格路径，否则装错地方：
@@ -262,12 +316,24 @@ jobs:
           CDEBUG=OFF
           CBUILD_TESTING=OFF
 
-          # 显式打开 ccache（acore.sh 默认 false）。
-          # CCACHE_DIR 必须固定成 C:/ccache，与上面"恢复 ccache 编译缓存"步骤的
-          # path 一致，否则存和取对不上，缓存等于没用。
-          export CCACHE_DIR="C:/ccache"
-          export CCACHE_MAXSIZE=2G
-          AC_CCACHE=true
+          # ---- ccache ----
+          # acore.sh 里 AC_CCACHE 默认是 false，必须显式打开。
+          # 开不开由工作流「准备 ccache 目录并自检」那一步决定：它自检失败就写 COA_CCACHE=false，
+          # 这里跟着降级。原因见那一步的注释 —— ccache 是 CMAKE_*_COMPILER_LAUNCHER，
+          # 它初始化失败会让 ninja 第一个文件就 exit 1，整个 2 小时的构建白跑。
+          AC_CCACHE="${COA_CCACHE:-true}"
+
+          # CCACHE_DIR / CCACHE_TEMPDIR / CCACHE_MAXSIZE 由那一步写进 GITHUB_ENV，这里只兜底。
+          export CCACHE_DIR="${CCACHE_DIR:-C:/ccache}"
+          export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-$CCACHE_DIR/tmp}"
+          export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
+
+          # 目录必须先存在。ccache 在缓存目录不存在时不会自己把目录树建全，
+          # 会直接 "Failed to write to <dir>/cache.debug: No such file or directory"，
+          # 而且因为它是编译器启动器，报错 = 编译直接停。
+          # （actions/cache 缓存未命中时不会创建目录，所以这一步是必需的。）
+          mkdir -p "$CCACHE_DIR" "$CCACHE_TEMPDIR" 2>/dev/null || true
+          echo "AC_CCACHE=$AC_CCACHE  CCACHE_DIR=$CCACHE_DIR"
 
           CCUSTOMOPTIONS="-DBOOST_ROOT=C:/local/boost_1_87_0 -DOPENSSL_ROOT_DIR=C:/openssl -DOPENSSL_USE_STATIC_LIBS=FALSE -DCMAKE_RC_COMPILER=rc -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON -DCMAKE_NINJA_CMCLDEPS_RC=OFF -DCMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_LIBRARIES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES=ON"
           EOF
@@ -293,9 +359,44 @@ jobs:
           ninja --version
           cl 2>&1 | head -n 2 || true
 
+          echo "AC_CCACHE=${COA_CCACHE:-true}  CCACHE_DIR=${CCACHE_DIR:-<unset>}"
+          command -v ccache && (ccache -s 2>&1 | head -n 12) || echo 'PATH 里没有 ccache'
+
           rm -rf var/build/obj
 
-          ./acore.sh compiler build
+          LOG=/c/ac/build.log
+          : > "$LOG"
+
+          # 不用 -e，自己收 exit code，方便失败后按需重试
+          set +e
+
+          ./acore.sh compiler build 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+
+          # 兜底网：ccache 是 CMAKE_*_COMPILER_LAUNCHER，它初始化/写缓存失败会让
+          # ninja 在第一个文件就 exit 1，跟"代码编译不过"长得一模一样。
+          # 只在日志确实像 ccache 问题时才关掉 ccache 重跑一次（重跑代价只有 configure 那十几秒），
+          # 其它失败原因原样退出，不做无谓重试。
+          if [ "$status" -ne 0 ] && grep -qiE 'ccache[^\n]*(error|fatal|failed)|(failed|error) to (write|create)[^\n]*ccache|ccache[^\n]*No such file or directory' "$LOG"; then
+            echo "::warning::日志显示是 ccache 初始化/写缓存失败，关掉 ccache 重试一次（编译本身没问题，就是慢）"
+            sed -i 's/^AC_CCACHE=.*/AC_CCACHE="false"/' conf/config.sh
+            grep -n '^AC_CCACHE' conf/config.sh
+            rm -rf var/build/obj
+            ./acore.sh compiler build 2>&1 | tee -a "$LOG"
+            status=${PIPESTATUS[0]}
+          fi
+
+          echo '--- ccache 统计（cache hit / miss 一眼看出缓存有没有用上）---'
+          ccache -s 2>&1 | head -n 16 || true
+
+          if [ "$status" -eq 0 ]; then
+            echo '编译完成：exit 0'
+          else
+            echo "::error::编译失败（exit $status），下面摘出日志里的 error/fatal："
+            grep -inE 'error|fatal' "$LOG" | tail -n 40 || true
+          fi
+
+          exit "$status"
 
       # 双重保险：万一路径前缀还是被解释成别的形式，
       # 这里把 exe / conf 找回来，别再出现"跑了 2 小时拿到一个空产物"。
