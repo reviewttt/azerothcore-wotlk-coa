@@ -1,0 +1,279 @@
+##############################################################################
+# Conquest of Azeroth（核心）+ mod-playerbots（模块）云编译 —— Windows 版
+#
+# 放到仓库的 .github/workflows/build-windows.yml
+# Actions → Build CoA + Playerbots (Windows) → Run workflow
+# 已 Fork 的话【什么都不用填】，直接 Run：core_repo 留空即代表编译你自己的 fork
+# 产物：运行页面底部 Artifacts → coa-server-windows-rXX.zip
+#       （authserver.exe / worldserver.exe + etc 全套配置，含 modules/playerbots.conf.dist）
+#
+# 首次全量编译约 2~4 小时（4 核 runner），第二次起有 ccache 会快很多。
+# 想要快就用 build-linux.yml（约 40~70 分钟）。
+##############################################################################
+name: Build CoA + Playerbots (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_repo:
+        description: '核心仓库 (owner/repo)。留空 = 编译当前仓库，也就是你的 fork'
+        required: false
+        default: ''
+      core_ref:
+        description: '核心分支 / 标签 / commit'
+        required: true
+        default: 'main'
+      module_repo:
+        description: '模块仓库 (owner/repo)'
+        required: true
+        default: 'Zyth45/mod-playerbots'
+      module_ref:
+        description: '模块分支 / 标签 / commit'
+        required: true
+        default: 'coa'
+      build_tools:
+        description: '是否同时编译地图提取工具 (map/vmap/mmap)'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coa-build-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Windows build
+    runs-on: windows-2022
+    timeout-minutes: 355
+
+    env:
+      BOOST_ROOT: C:\local\boost_1_87_0
+      CMAKE_GENERATOR: Ninja
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. 取两份源码：核心放工作区，模块放进核心的 modules/ 目录
+      # ------------------------------------------------------------------
+      - name: 拉取核心源码
+        uses: actions/checkout@v4
+        with:
+          # core_repo 留空时 = github.repository，即当前仓库（你 fork 的那份）
+          repository: ${{ inputs.core_repo != '' && inputs.core_repo || github.repository }}
+          ref: ${{ inputs.core_ref }}
+          path: a
+          fetch-depth: 1
+
+      - name: 拉取 mod-playerbots 到 core 的 modules 目录
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.module_repo }}
+          ref: ${{ inputs.module_ref }}
+          path: a/modules/mod-playerbots
+          fetch-depth: 1
+
+      # MSVC 有 260 字符路径限制，先搬到 C:\ac 这样的短路径再编译
+      - name: 移动到短路径 C:\ac
+        shell: pwsh
+        run: |
+          if (Test-Path C:\ac) { Remove-Item C:\ac -Recurse -Force }
+          New-Item -ItemType Directory -Path C:\ac | Out-Null
+          robocopy "${{ github.workspace }}\a" "C:\ac" /MIR /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -le 7) { exit 0 }
+          exit $LASTEXITCODE
+
+      - name: 记录本次实际编译的版本
+        shell: bash
+        run: |
+          CORE_REPO="${{ inputs.core_repo != '' && inputs.core_repo || github.repository }}"
+          {
+            echo "### 本次编译的版本"
+            echo ""
+            echo "| 来源 | 版本 | commit |"
+            echo "|---|---|---|"
+            echo "| core | ${CORE_REPO}@${{ inputs.core_ref }} | \`$(git -C /c/ac rev-parse --short HEAD)\` |"
+            echo "| mod  | ${{ inputs.module_repo }}@${{ inputs.module_ref }} | \`$(git -C /c/ac/modules/mod-playerbots rev-parse --short HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. 准备依赖：Boost / MySQL 客户端 / OpenSSL / Ninja
+      #    （windows-2022 镜像自带 CMake、VS2022、OpenSSL，但不带 Boost 和 MySQL 开发库）
+      # ------------------------------------------------------------------
+      - name: 缓存 Boost 与 MySQL 客户端
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\local\boost_1_87_0
+            C:\tools\mysql\current
+          key: win-deps-boost-1.87.0-mysql-8.4.9
+
+      - name: 安装 Ninja 与 Boost 1.87
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          choco install ninja -y --no-progress
+
+          if (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp') {
+            Write-Host 'Boost 命中缓存，跳过安装'
+            exit 0
+          }
+
+          # 首选 chocolatey（与 mod-playerbots 官方 CI 一致，装到 C:\local\boost_1_87_0）
+          choco install boost-msvc-14.3 --version=1.87.0 -y --no-progress
+          if (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp') {
+            Write-Host 'choco 安装 Boost 成功'
+            exit 0
+          }
+
+          # 兜底：从 SourceForge 官方预编译包直接装
+          Write-Host 'choco 失败，改用 SourceForge 官方包'
+          $exe = Join-Path $env:RUNNER_TEMP 'boost.exe'
+          Invoke-WebRequest -Uri 'https://downloads.sourceforge.net/project/boost/boost-binaries/1.87.0/boost_1_87_0-msvc-14.3-64.exe' `
+            -OutFile $exe -UserAgent 'coa-ci' -MaximumRetryCount 3 -RetryIntervalSec 15
+          Start-Process -FilePath $exe -Wait -ArgumentList @(
+            '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\local\boost_1_87_0'
+          )
+          if (-not (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp')) { throw 'Boost 安装失败' }
+
+      # 关键：Windows 下 acore.sh 会把 MySQL 路径硬编码成 C:\tools\mysql\current，
+      # 镜像上没有这个目录，不准备的话 CMake 会直接报找不到 MySQL。
+      - name: 安装 MySQL 8.4 客户端库
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (Test-Path 'C:\tools\mysql\current\lib\mysqlclient.lib') {
+            Write-Host 'MySQL 客户端命中缓存，跳过下载'
+            exit 0
+          }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'mysql.zip'
+          # 必须带浏览器 UA，否则 Oracle 返回的是 HTML 错误页
+          Invoke-WebRequest -Uri 'https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.9-winx64.zip' `
+            -OutFile $zip -UserAgent 'Mozilla/5.0'
+          $mb = (Get-Item $zip).Length / 1MB
+          Write-Host ("下载 MySQL zip: {0:N1} MB" -f $mb)
+          if ($mb -lt 50) { throw "MySQL 包大小异常（$([int]$mb) MB）" }
+
+          New-Item -ItemType Directory -Force -Path 'C:\tools\mysql' | Out-Null
+          Expand-Archive -Path $zip -DestinationPath 'C:\tools\mysql' -Force
+          if (Test-Path 'C:\tools\mysql\current') { Remove-Item -Recurse -Force 'C:\tools\mysql\current' }
+          Rename-Item 'C:\tools\mysql\mysql-8.4.9-winx64' 'C:\tools\mysql\current'
+
+          if (-not (Test-Path 'C:\tools\mysql\current\lib\mysqlclient.lib')) {
+            throw '没找到 C:\tools\mysql\current\lib\mysqlclient.lib'
+          }
+
+      - name: 准备 OpenSSL（复用镜像自带的）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64')
+          $opensslRoot = $candidates |
+            Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } |
+            Select-Object -First 1
+
+          if (-not $opensslRoot) { throw '镜像里找不到 OpenSSL 开发文件' }
+          Write-Host "使用 OpenSSL: $opensslRoot"
+
+          if (Test-Path C:\openssl) { Remove-Item C:\openssl -Recurse -Force }
+          New-Item -ItemType Junction -Path C:\openssl -Target $opensslRoot | Out-Null
+
+          "OPENSSL_ROOT_DIR=C:\openssl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_DIR=C:\openssl"      | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ------------------------------------------------------------------
+      # 3. ccache（注意：acore.sh 里 AC_CCACHE 默认是 false，必须在 config.sh 里显式打开）
+      # ------------------------------------------------------------------
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.13
+        with:
+          key: coa-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}
+          max-size: 2G
+
+      - name: 写入 acore.sh 编译配置 conf/config.sh
+        shell: bash
+        working-directory: C:\ac
+        run: |
+          mkdir -p conf
+          cat > conf/config.sh <<EOF
+          # 由 GitHub Actions 生成
+
+          CCOMPILERC="cl"
+          CCOMPILERCXX="cl"
+
+          CTYPE="Release"
+          CSCRIPTS="static"
+          CMODULES="static"
+          CAPPS_BUILD="all"
+          CTOOLS_BUILD="${{ inputs.build_tools == 'yes' && 'all' || 'none' }}"
+
+          # 自定义核心代码多，关掉警告避免噪音
+          CWARNINGS=OFF
+          CDEBUG=OFF
+          CBUILD_TESTING=OFF
+
+          # 显式打开 ccache（acore.sh 默认 false）
+          # 不要在这里设置 CCACHE_DIR：交给上面的 ccache action 管理，
+          # 否则缓存目录会对不上，等于白编译一次。
+          AC_CCACHE=true
+
+          CCUSTOMOPTIONS="-DBOOST_ROOT=C:/local/boost_1_87_0 -DOPENSSL_ROOT_DIR=C:/openssl -DOPENSSL_USE_STATIC_LIBS=FALSE -DCMAKE_RC_COMPILER=rc -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON -DCMAKE_NINJA_CMCLDEPS_RC=OFF -DCMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_LIBRARIES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES=ON"
+          EOF
+          echo '--- conf/config.sh ---'
+          cat conf/config.sh
+
+      # ------------------------------------------------------------------
+      # 4. 编译
+      # ------------------------------------------------------------------
+      - name: 启用 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: x64
+
+      - name: 编译（acore.sh compiler build = configure + compile + install）
+        shell: bash
+        working-directory: C:\ac
+        env:
+          CC: cl
+          CXX: cl
+        run: |
+          cmake --version
+          ninja --version
+          cl 2>&1 | head -n 2 || true
+
+          rm -rf var/build/obj
+
+          ./acore.sh compiler build
+
+      # ------------------------------------------------------------------
+      # 5. 产物（Windows 下 exe 直接落在 env/dist/，配置在 env/dist/etc/）
+      # ------------------------------------------------------------------
+      - name: 查看产物
+        shell: bash
+        working-directory: C:\ac
+        run: |
+          ls -lh env/dist/*.exe 2>/dev/null || true
+          ls -lh env/dist/etc 2>/dev/null || true
+          ls -lh env/dist/etc/modules 2>/dev/null || true
+
+          {
+            echo "### 编译产物"
+            echo ""
+            ls -lh env/dist/*.exe 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-server-windows-r${{ github.run_number }}
+          path: C:\ac\env\dist
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
