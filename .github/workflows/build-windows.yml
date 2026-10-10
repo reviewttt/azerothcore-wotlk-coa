@@ -5,7 +5,10 @@
 # Actions → Build CoA + Playerbots (Windows) → Run workflow
 # 已 Fork 的话【什么都不用填】，直接 Run：core_repo 留空即代表编译你自己的 fork
 # 产物：运行页面底部 Artifacts → coa-server-windows-rXX.zip
-#       （authserver.exe / worldserver.exe + etc 全套配置，含 modules/playerbots.conf.dist）
+#       最小包：authserver.exe + worldserver.exe + 几个运行时 DLL（+ 1KB 的 BUILD_INFO.txt）
+#       不含 etc/ 配置模板和 startup 脚本 —— 本地源码里本来就有，没必要重复下载。
+#       另有一个可选的 coa-db-source-rXX.zip（约 240MB，数据库源目录），
+#       由输入项 db_source 控制，默认 no（本地已有源码就不需要）。
 #
 # 首次全量编译约 2~4 小时（4 核 runner），第二次起有 ccache 会快很多。
 # 想要快就用 build-linux.yml（约 40~70 分钟）。
@@ -33,6 +36,13 @@ on:
         default: 'coa'
       build_tools:
         description: '是否同时编译地图提取工具 (map/vmap/mmap)'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+      db_source:
+        description: '是否打包数据库源目录 coa-db-source（约 240MB，全是 SQL；本地已有源码时不需要）'
         type: choice
         options:
           - 'no'
@@ -204,11 +214,23 @@ jobs:
       # ------------------------------------------------------------------
       # 3. ccache（注意：acore.sh 里 AC_CCACHE 默认是 false，必须在 config.sh 里显式打开）
       # ------------------------------------------------------------------
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.13
+      # ccache 本体 runner 上没有，choco 装一下（会进 PATH，供 CMAKE_*_COMPILER_LAUNCHER 调用）
+      - name: 安装 ccache
+        shell: pwsh
+        run: choco install ccache -y --no-progress
+
+      # 缓存目录自己管：CCACHE_DIR 在下面 conf/config.sh 里固定成 C:\ccache，
+      # 这里用官方 actions/cache 存取。之前用 hendrikmuhs/ccache-action，
+      # 两次运行恢复缓存都报 400（Failed to restore: Cache service responded with 400），
+      # 导致每次都全量编译 2 小时+。
+      - name: 恢复 ccache 编译缓存
+        uses: actions/cache@v4
         with:
-          key: coa-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}
-          max-size: 2G
+          path: C:\ccache
+          key: coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-v2
+          restore-keys: |
+            coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-
+            coa-ccache-win-
 
       - name: 写入 acore.sh 编译配置 conf/config.sh
         shell: bash
@@ -240,9 +262,11 @@ jobs:
           CDEBUG=OFF
           CBUILD_TESTING=OFF
 
-          # 显式打开 ccache（acore.sh 默认 false）
-          # 不要在这里设置 CCACHE_DIR：交给上面的 ccache action 管理，
-          # 否则缓存目录会对不上，等于白编译一次。
+          # 显式打开 ccache（acore.sh 默认 false）。
+          # CCACHE_DIR 必须固定成 C:/ccache，与上面"恢复 ccache 编译缓存"步骤的
+          # path 一致，否则存和取对不上，缓存等于没用。
+          export CCACHE_DIR="C:/ccache"
+          export CCACHE_MAXSIZE=2G
           AC_CCACHE=true
 
           CCUSTOMOPTIONS="-DBOOST_ROOT=C:/local/boost_1_87_0 -DOPENSSL_ROOT_DIR=C:/openssl -DOPENSSL_USE_STATIC_LIBS=FALSE -DCMAKE_RC_COMPILER=rc -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON -DCMAKE_NINJA_CMCLDEPS_RC=OFF -DCMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_LIBRARIES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES=ON"
@@ -363,8 +387,26 @@ jobs:
           ls -lh env/dist/etc 2>/dev/null || true
           ls -lh env/dist/etc/modules 2>/dev/null || true
 
+          # 硬校验：没有 exe 就直接失败，绝不上传一个"看起来成功"的空包
+          if [ ! -f env/dist/worldserver.exe ] || [ ! -f env/dist/authserver.exe ]; then
+            echo "::error::env/dist 里没有 worldserver.exe / authserver.exe，编译安装环节有问题，不打包上传"
+            exit 1
+          fi
+
+          # 体积合理性检查：exe 是 Release 编译，两个加起来不可能小于 20MB。
+          # 这一步同时把"产物清单"写进运行摘要，方便上传后对照 Artifacts 里的大小。
+          DIST_MB=$(du -sm env/dist | cut -f1)
+          EXE_MB=$(du -cm env/dist/*.exe | tail -1 | cut -f1)
+          echo "env/dist 总计 ${DIST_MB} MB，其中 exe ${EXE_MB} MB"
+          if [ "$EXE_MB" -lt 20 ]; then
+            echo "::error::exe 体积只有 ${EXE_MB} MB，明显不对（Release 版 worldserver.exe 至少几十 MB），停止上传"
+            exit 1
+          fi
+
           {
             echo "### 编译产物"
+            echo ""
+            echo "env/dist 总计 **${DIST_MB} MB**，其中 exe **${EXE_MB} MB**"
             echo ""
             ls -lh env/dist/*.exe env/dist/*.dll 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || true
           } >> "$GITHUB_STEP_SUMMARY"
@@ -423,7 +465,9 @@ jobs:
       # 云编译的 exe 里"烘焙"的源码路径是 runner 上的 C:\ac，在你自己电脑上并不存在，
       # 所以必须把一份 SQL 目录放到本地，再用 worldserver.conf 的 SourceDirectory 指过去。
       # 这里按 exe 实际编译的那份源码打包，保证 SQL 和 exe 版本次次对应。
+      # 默认不打包（输入项 db_source = no）：241MB 全是 SQL，本地留一份源码就够用了。
       - name: 打包数据库源目录（worldserver 自动更新用）
+        if: ${{ inputs.db_source == 'yes' }}
         shell: pwsh
         run: |
           function Copy-SqlTree {
@@ -475,16 +519,76 @@ jobs:
           $summary += ('- coa-db-source-r{0}.zip（{1:N0} MB）：解压后把 worldserver.conf 里的 SourceDirectory 指向它，worldserver 就会自己更新数据库' -f ${{ github.run_number }}, ($info.Length / 1MB))
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
+      # ------------------------------------------------------------------
+      # 7. 只打包"能跑起来的最小集合"
+      #     env/dist 里其实还有 etc/ 配置模板、acore.sh 拷进去的 startup 脚本等；
+      #     本地既然留了一份源码当 SQL 源，这些模板就已经有了，不必再重复下几十 MB。
+      #     所以这里挑出 exe + 运行时 DLL（+ BUILD_INFO.txt）另存到 C:\ac\pkg，只上传它。
+      #     想换回整包：把下面"上传产物"的 path 改回 C:\ac\env\dist 即可。
+      # ------------------------------------------------------------------
+      - name: 整理最小产物包（两个 exe + 运行时 DLL）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'C:\ac\env\dist'
+          $pkg  = 'C:\ac\pkg'
+
+          if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          # 两个 exe 是刚需，缺一个就直接失败
+          foreach ($n in @('authserver.exe', 'worldserver.exe')) {
+            $f = Join-Path $dist $n
+            if (-not (Test-Path $f)) { throw "$dist 里没有 $n，无法打包" }
+            Copy-Item $f $pkg -Force
+          }
+
+          # 运行时 DLL 全部带上（libmysql / libcrypto-3-x64 / libssl-3-x64 / legacy 等）
+          $dlls = @(Get-ChildItem (Join-Path $dist '*.dll') -File -ErrorAction SilentlyContinue)
+          if ($dlls.Count -eq 0) { throw 'env/dist 里一个运行时 DLL 都没有，产物跑不起来' }
+          $dlls | ForEach-Object { Copy-Item $_.FullName $pkg -Force }
+
+          # 三个 dll 缺了必然起不来，单独点名警告
+          foreach ($req in @('libmysql.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll')) {
+            if (-not (Test-Path (Join-Path $pkg $req))) { Write-Warning "缺少必需 DLL: $req" }
+          }
+
+          # 1KB 的版本凭据，用来把本地源码对齐到本次编译的 commit
+          $info = Join-Path $dist 'BUILD_INFO.txt'
+          if (Test-Path $info) { Copy-Item $info $pkg -Force }
+
+          Write-Host '--- 最小产物包内容 ---'
+          Get-ChildItem $pkg -File | Sort-Object Name | Select-Object Name, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          $files = @(Get-ChildItem $pkg -File)
+          $mb    = ($files | Measure-Object Length -Sum).Sum / 1MB
+          $exeMb = (@($files | Where-Object Extension -eq '.exe') | Measure-Object Length -Sum).Sum / 1MB
+          Write-Host ("合计 {0:N1} MB（其中 exe {1:N1} MB），共 {2} 个文件" -f $mb, $exeMb, $files.Count)
+
+          $summary = @(
+            '### 最小产物包',
+            '',
+            ('只含两个 exe + 运行时 DLL + BUILD_INFO.txt，合计 **{0:N1} MB**（exe {1:N1} MB）' -f $mb, $exeMb),
+            ''
+          )
+          $summary += @($files | Sort-Object Name | ForEach-Object {
+            '- `{0}` —— {1:N1} MB' -f $_.Name, ($_.Length / 1MB)
+          })
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: coa-server-windows-r${{ github.run_number }}
-          path: C:\ac\env\dist
+          # 只传最小包 C:\ac\pkg（两个 exe + DLL）；要整包就改成 C:\ac\env\dist
+          path: C:\ac\pkg
           if-no-files-found: error
           retention-days: 14
           compression-level: 6
 
       - name: 上传数据库源目录
+        if: ${{ inputs.db_source == 'yes' }}
         uses: actions/upload-artifact@v4
         with:
           name: coa-db-source-r${{ github.run_number }}
