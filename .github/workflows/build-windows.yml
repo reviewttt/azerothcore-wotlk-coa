@@ -5,10 +5,15 @@
 # Actions → Build CoA + Playerbots (Windows) → Run workflow
 # 已 Fork 的话【什么都不用填】，直接 Run：core_repo 留空即代表编译你自己的 fork
 # 产物：运行页面底部 Artifacts → coa-server-windows-rXX.zip
-#       最小包：authserver.exe + worldserver.exe + 几个运行时 DLL（+ 1KB 的 BUILD_INFO.txt）
+#       最小包：authserver.exe + worldserver.exe + 几个运行时 DLL
+#       （+ BUILD_INFO.txt 版本凭据、MANIFEST.txt 清单与 SHA-256）
 #       不含 etc/ 配置模板和 startup 脚本 —— 本地源码里本来就有，没必要重复下载。
 #       另有一个可选的 coa-db-source-rXX.zip（约 240MB，数据库源目录），
 #       由输入项 db_source 控制，默认 no（本地已有源码就不需要）。
+#
+# 想确认"包到底传上去没有"：看运行摘要里的「Artifacts 上传结果」，
+# 有直链 + SHA-256 就是真上去了（最后一步会在拿不到 artifact-url 时直接报错）。
+# 产物保留 30 天；重跑（Re-run all jobs）不会因为重名而失败（overwrite: true）。
 #
 # 首次全量编译约 2~4 小时（4 核 runner），第二次起有 ccache 会快很多。
 # 想要快就用 build-linux.yml（约 40~70 分钟）。
@@ -289,8 +294,9 @@ jobs:
         working-directory: C:\ac
         run: |
           mkdir -p conf
-          # 注意 <<'EOF' 用引号：里面的 ${...} 要原样留给 acore.sh source 时再展开，
-          # 不要在这一步就被替换掉。${{ }} 那两处是 GitHub 在传给 bash 之前就替换好的，不受影响。
+          # 注意 <<'EOF' 要用引号：里面的 ${...} 要原样留着，等 acore.sh source 这个文件时再展开，
+          # 不能在这一步就被替换掉。GitHub 的模板表达式（CTA 那套 inputs / github 变量）是
+          # GitHub 在把脚本交给 bash 之前就替换好的，不受引号影响，照样能生效。
           cat > conf/config.sh <<'EOF'
           # 由 GitHub Actions 生成
 
@@ -658,11 +664,31 @@ jobs:
           $info = Join-Path $dist 'BUILD_INFO.txt'
           if (Test-Path $info) { Copy-Item $info $pkg -Force }
 
+          # ★ 体积硬校验：以前出过"跑了 2 小时、包里只有 33KB 启动脚本"的事，
+          #   这里在打包目录上再确认一次 exe 是真货，不合格就别上传。
+          foreach ($pair in @(@('worldserver.exe', 20), @('authserver.exe', 5))) {
+            $f = Get-Item (Join-Path $pkg $pair[0])
+            if ($f.Length -lt $pair[1] * 1MB) {
+              throw "$($pair[0]) 只有 $([math]::Round($f.Length/1MB,1)) MB（Release 产物至少 $($pair[1]) MB），明显不对，停止打包"
+            }
+          }
+
+          # 清单 + SHA-256：以后核对"下载到的包对不对"不用猜
+          $files   = @(Get-ChildItem $pkg -File | Sort-Object Name)
+          $manifest = @('# 最小产物包清单', "# built_at = $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')", '')
+          foreach ($f in $files) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+            $manifest += ('{0}`t{1:N0} bytes`t{2}' -f $f.Name, $f.Length, $h)
+          }
+          $manifest += @('', '用 PowerShell 校验下载到的文件：')
+          $manifest += '  Get-FileHash .\<文件名> -Algorithm SHA256'
+          $manifest | Out-File -FilePath (Join-Path $pkg 'MANIFEST.txt') -Encoding utf8
+          $files = @(Get-ChildItem $pkg -File | Sort-Object Name)
+
           Write-Host '--- 最小产物包内容 ---'
-          Get-ChildItem $pkg -File | Sort-Object Name | Select-Object Name, Length |
+          $files | Select-Object Name, Length |
             Format-Table -AutoSize | Out-String | Write-Host
 
-          $files = @(Get-ChildItem $pkg -File)
           $mb    = ($files | Measure-Object Length -Sum).Sum / 1MB
           $exeMb = (@($files | Where-Object Extension -eq '.exe') | Measure-Object Length -Sum).Sum / 1MB
           Write-Host ("合计 {0:N1} MB（其中 exe {1:N1} MB），共 {2} 个文件" -f $mb, $exeMb, $files.Count)
@@ -670,30 +696,81 @@ jobs:
           $summary = @(
             '### 最小产物包',
             '',
-            ('只含两个 exe + 运行时 DLL + BUILD_INFO.txt，合计 **{0:N1} MB**（exe {1:N1} MB）' -f $mb, $exeMb),
-            ''
+            ('只含两个 exe + 运行时 DLL + BUILD_INFO.txt + MANIFEST.txt，合计 **{0:N1} MB**（exe {1:N1} MB），共 {2} 个文件' -f $mb, $exeMb, $files.Count),
+            '',
+            '| 文件 | 大小 |',
+            '|---|---|'
           )
-          $summary += @($files | Sort-Object Name | ForEach-Object {
-            '- `{0}` —— {1:N1} MB' -f $_.Name, ($_.Length / 1MB)
-          })
+          $summary += @($files | ForEach-Object { '| `{0}` | {1:N1} MB |' -f $_.Name, ($_.Length / 1MB) })
+          $summary += @('', 'SHA-256 见包内 `MANIFEST.txt`，下载后可用 `Get-FileHash` 核对。')
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: 上传产物
+        id: upload_server
         uses: actions/upload-artifact@v4
         with:
           name: coa-server-windows-r${{ github.run_number }}
           # 只传最小包 C:\ac\pkg（两个 exe + DLL）；要整包就改成 C:\ac\env\dist
           path: C:\ac\pkg
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           compression-level: 6
+          # 同一次运行里点 "Re-run all jobs" 会撞上同名 artifact，v4 默认直接失败。
+          # 打开 overwrite 覆盖旧的，避免"好不容易跑完 2 小时，重跑却挂在上传这一步"。
+          overwrite: true
 
       - name: 上传数据库源目录
         if: ${{ inputs.db_source == 'yes' }}
+        id: upload_db
         uses: actions/upload-artifact@v4
         with:
           name: coa-db-source-r${{ github.run_number }}
           path: ${{ env.DB_PKG_ZIP }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           compression-level: 0
+          overwrite: true
+
+      # ★ 最后一步：把"到底传上去了什么"钉死在运行摘要里。
+      #   upload-artifact 的 artifact-url / artifact-digest 只有在**真正上传成功**时才有值，
+      #   为空就说明包其实没上去。以前"步骤是绿的、Artifacts 里却找不到包"的情况，
+      #   从这里就能立刻分辨：要么直接报错，要么留下一串可点开的下载链接 + SHA-256。
+      - name: 记录上传结果（Artifacts 链接与校验和）
+        shell: pwsh
+        run: |
+          $lines = @('### Artifacts 上传结果', '')
+          $name1 = 'coa-server-windows-r${{ github.run_number }}'
+          $url1  = '${{ steps.upload_server.outputs.artifact-url }}'
+          $dig1  = '${{ steps.upload_server.outputs.artifact-digest }}'
+          $id1   = '${{ steps.upload_server.outputs.artifact-id }}'
+
+          if ([string]::IsNullOrWhiteSpace($url1)) {
+            $lines += '- ❌ **' + $name1 + '**：artifact-url 为空 —— 这个包并没有真正上传成功'
+          } else {
+            $lines += '- ✅ **' + $name1 + '**（artifact id ' + $id1 + '）'
+            $lines += '    - SHA-256: ' + $dig1
+            $lines += '    - 下载: ' + $url1
+          }
+
+          if ('${{ inputs.db_source }}' -eq 'yes') {
+            $name2 = 'coa-db-source-r${{ github.run_number }}'
+            $url2  = '${{ steps.upload_db.outputs.artifact-url }}'
+            $dig2  = '${{ steps.upload_db.outputs.artifact-digest }}'
+            $id2   = '${{ steps.upload_db.outputs.artifact-id }}'
+            if ([string]::IsNullOrWhiteSpace($url2)) {
+              $lines += '- ❌ **' + $name2 + '**：artifact-url 为空'
+            } else {
+              $lines += '- ✅ **' + $name2 + '**（artifact id ' + $id2 + '）'
+              $lines += '    - SHA-256: ' + $dig2
+              $lines += '    - 下载: ' + $url2
+            }
+          }
+
+          $lines += @('', '> 上面的链接就是该次运行的 Artifacts（需登录 GitHub 才能下载）。', '> 运行页面**最下方**的 Artifacts 区块里也能看到同名条目。')
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | Where-Object { $_ -ne '' } | ForEach-Object { Write-Host $_ }
+
+          if ([string]::IsNullOrWhiteSpace($url1)) {
+            throw '上传产物后没拿到 artifact-url，判定为上传失败（Artifacts 里不会有包）'
+          }
+          Write-Host '主产物已确认上传成功。'
