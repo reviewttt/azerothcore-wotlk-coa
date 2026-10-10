@@ -188,6 +188,19 @@ jobs:
           "OPENSSL_ROOT_DIR=C:\openssl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "OPENSSL_DIR=C:\openssl"      | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: 打印本次使用的依赖版本
+        shell: pwsh
+        run: |
+          (Select-String -Path 'C:\local\boost_1_87_0\boost\version.hpp' -Pattern 'BOOST_LIB_VERSION').Line |
+            ForEach-Object { Write-Host "Boost   : $($_.Trim())" }
+          (Select-String -Path 'C:\local\boost_1_87_0\boost\version.hpp' -Pattern 'BOOST_VERSION ').Line |
+            ForEach-Object { Write-Host "Boost   : $($_.Trim())" }
+
+          Write-Host "MySQL   : $((& 'C:\tools\mysql\current\bin\mysql.exe' --version))"
+          Write-Host "OpenSSL : $((& 'C:\openssl\bin\openssl.exe' version))"
+          Write-Host "CMake   : $((& cmake --version | Select-Object -First 1))"
+          Write-Host "Ninja   : $((& ninja --version))"
+
       # ------------------------------------------------------------------
       # 3. ccache（注意：acore.sh 里 AC_CCACHE 默认是 false，必须在 config.sh 里显式打开）
       # ------------------------------------------------------------------
@@ -204,6 +217,14 @@ jobs:
           mkdir -p conf
           cat > conf/config.sh <<EOF
           # 由 GitHub Actions 生成
+
+          # ★ 必须显式写成 Windows 风格路径，否则装错地方：
+          # acore.sh 默认 BINPATH="$AC_PATH_ROOT/env/dist"，而 AC_PATH_ROOT 在 git-bash 下是
+          # MSYS 风格（/c/ac）。它变成 -DCMAKE_INSTALL_PREFIX=/c/ac/env/dist 传给 cmake.exe 时，
+          # 带 -D 前缀的参数不会被 MSYS 自动转换成 Windows 路径，
+          # CMake 会把 /c/ac/env/dist 解释成 C:/c/ac/env/dist
+          # → exe 和 etc/ 全装到那儿，产物目录里只剩 acore.sh 拷过去的 startup-scripts 脚本。
+          BINPATH="C:/ac/env/dist"
 
           CCOMPILERC="cl"
           CCOMPILERCXX="cl"
@@ -252,22 +273,207 @@ jobs:
 
           ./acore.sh compiler build
 
+      # 双重保险：万一路径前缀还是被解释成别的形式，
+      # 这里把 exe / conf 找回来，别再出现"跑了 2 小时拿到一个空产物"。
+      - name: 确认安装位置（必要时把产物捞回 env/dist）
+        shell: pwsh
+        run: |
+          $dist = 'C:\ac\env\dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          if (Test-Path (Join-Path $dist 'worldserver.exe')) {
+            Write-Host 'OK: env/dist 里已有 worldserver.exe'
+            exit 0
+          }
+
+          Write-Warning 'env/dist 里没有 worldserver.exe，开始查找其它可能的安装位置'
+
+          $found = $false
+          foreach ($cand in @('C:\c\ac\env\dist', 'C:\ac\c\ac\env\dist', 'C:\ac\env\dist\bin')) {
+            if (Test-Path (Join-Path $cand 'worldserver.exe')) {
+              Write-Host "找到: $cand  -> 合并进 $dist"
+              robocopy $cand $dist /E /NFL /NDL /NJH /NJS /NP | Out-Null
+              $global:LASTEXITCODE = 0
+              $found = $true
+            }
+          }
+
+          if (-not $found) {
+            Write-Warning '候选目录里也没有，改从构建树里捞 exe / conf 兜底'
+            Get-ChildItem 'C:\ac\var\build' -Recurse -Include 'worldserver.exe','authserver.exe' -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName $dist -Force; Write-Host "  拷入 $($_.FullName)" }
+
+            $etc = Join-Path $dist 'etc'
+            if (-not (Test-Path $etc)) {
+              New-Item -ItemType Directory -Force -Path $etc | Out-Null
+              Get-ChildItem 'C:\ac\src' -Recurse -Filter '*.conf.dist' -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item $_.FullName $etc -Force }
+              Write-Host "  已从源码拷入 $((Get-ChildItem $etc -Filter '*.conf.dist').Count) 个 conf 模板"
+            }
+          }
+
+          Write-Host '--- env/dist 当前内容 ---'
+          Get-ChildItem $dist -Force | Select-Object Mode, Length, Name | Format-Table -AutoSize | Out-String | Write-Host
+
       # ------------------------------------------------------------------
       # 5. 产物（Windows 下 exe 直接落在 env/dist/，配置在 env/dist/etc/）
       # ------------------------------------------------------------------
+      # OpenSSL 是动态链接的（CCUSTOMOPTIONS 里 OPENSSL_USE_STATIC_LIBS=FALSE），
+      # 模块 README_COA.md 也明确要求把 libmysql.dll / libcrypto-3-x64.dll /
+      # libssl-3-x64.dll / legacy.dll 放到 worldserver.exe 旁边，这里全部补进产物目录，
+      # 并把每个 exe 的真实依赖列出来，方便排查"缺 dll 打不开"。
+      - name: 补齐运行时 DLL 并列出 exe 的依赖
+        shell: pwsh
+        run: |
+          $dist = 'C:\ac\env\dist'
+
+          $candidates = @(
+            'C:\openssl\bin\libcrypto*.dll',
+            'C:\openssl\bin\libssl*.dll',
+            'C:\openssl\bin\legacy.dll',
+            'C:\openssl\lib\ossl-modules\legacy.dll',
+            'C:\tools\mysql\current\bin\libmysql.dll',
+            'C:\tools\mysql\current\lib\libmysql.dll'
+          )
+
+          $copied = @()
+          foreach ($pattern in $candidates) {
+            foreach ($f in @(Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
+              Copy-Item $f.FullName $dist -Force
+              $copied += $f.Name
+              Write-Host "已拷贝 $($f.Name)"
+            }
+          }
+          if ($copied.Count -eq 0) { Write-Warning '一个候选 DLL 都没找到，产物里的 exe 可能缺依赖' }
+
+          foreach ($name in @('worldserver.exe','authserver.exe')) {
+            $exe = Join-Path $dist $name
+            if (Test-Path $exe) {
+              Write-Host "--- $name 依赖的 DLL ---"
+              & dumpbin /nologo /dependents $exe 2>$null | Select-String '\.dll'
+            }
+          }
+
       - name: 查看产物
         shell: bash
         working-directory: C:\ac
         run: |
           ls -lh env/dist/*.exe 2>/dev/null || true
+          ls -lh env/dist/*.dll 2>/dev/null || true
           ls -lh env/dist/etc 2>/dev/null || true
           ls -lh env/dist/etc/modules 2>/dev/null || true
 
           {
             echo "### 编译产物"
             echo ""
-            ls -lh env/dist/*.exe 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || true
+            ls -lh env/dist/*.exe env/dist/*.dll 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || true
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 5.5 把"这份 exe 对应哪个 commit"写进产物
+      #     SQL 和 exe 必须同版本：exe 会按 updates 表里记录的版本决定跑哪些更新，
+      #     本地 SQL 太旧会漏更新，太新会报 "requires newer core"。
+      #     worldserver 启动时打印的 AzerothCore rev. <hash> 就是这个 core_commit。
+      # ------------------------------------------------------------------
+      - name: 写入 BUILD_INFO.txt（本地源码对齐版本用）
+        shell: pwsh
+        run: |
+          $core = 'C:\ac'
+          $mod  = 'C:\ac\modules\mod-playerbots'
+
+          $coreHash = (git -C $core rev-parse HEAD).Trim()
+          $coreDate = (git -C $core log -1 --format=%cI).Trim()
+          $coreMsg  = ((git -C $core log -1 --format=%s).Trim())
+          $modHash  = (git -C $mod rev-parse HEAD).Trim()
+          $modDate  = (git -C $mod log -1 --format=%cI).Trim()
+
+          $lines = @(
+            'CoA + Playerbots build info'
+            '==========================='
+            "built_at      = $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
+            'runner        = windows-2022'
+            ''
+            'core_repo     = ${{ inputs.core_repo != '' && inputs.core_repo || github.repository }}'
+            'core_ref      = ${{ inputs.core_ref }}'
+            "core_commit   = $coreHash"
+            "core_date     = $coreDate"
+            "core_subject  = $coreMsg"
+            ''
+            'module_repo   = ${{ inputs.module_repo }}'
+            'module_ref    = ${{ inputs.module_ref }}'
+            "module_commit = $modHash"
+            "module_date   = $modDate"
+            ''
+            '--- 怎么用 ---'
+            '1) 本地那份源码要"对齐到这个 commit"，SQL 才和 exe 同版本：'
+            "   git -C <核心源码目录> fetch origin && git -C <核心源码目录> checkout $coreHash"
+            "   git -C <核心源码目录>/modules/mod-playerbots fetch origin && git -C <核心源码目录>/modules/mod-playerbots checkout $modHash"
+            '   （用 coa-playerbots-ci/tools/sync-db-source.ps1 -CoreCommit <hash> -ModuleCommit <hash> 可以一条命令搞定）'
+            '2) worldserver.conf 里 SourceDirectory 指向这份源码根目录，MySQLExecutable 指向 mysql.exe，'
+            '   Updates.EnableDatabases = 15（1+2+4+8，8 = playerbots 库）。'
+            '3) worldserver 启动日志里的 "AzerothCore rev. <hash>" 应当和 core_commit 一致。'
+          )
+          $out = 'C:\ac\env\dist\BUILD_INFO.txt'
+          $lines | Out-File -FilePath $out -Encoding utf8
+          Get-Content $out
+
+      # ------------------------------------------------------------------
+      # 6. 数据库源目录：worldserver 启动时按它去找 SQL 做自动更新
+      # ------------------------------------------------------------------
+      # 云编译的 exe 里"烘焙"的源码路径是 runner 上的 C:\ac，在你自己电脑上并不存在，
+      # 所以必须把一份 SQL 目录放到本地，再用 worldserver.conf 的 SourceDirectory 指过去。
+      # 这里按 exe 实际编译的那份源码打包，保证 SQL 和 exe 版本次次对应。
+      - name: 打包数据库源目录（worldserver 自动更新用）
+        shell: pwsh
+        run: |
+          function Copy-SqlTree {
+            param([string]$Src, [string]$Dst, [string[]]$Exclude)
+            if (-not (Test-Path $Src)) { Write-Host "跳过（源码里没有）: $Src"; return }
+            $a = @($Src, $Dst, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+            if ($Exclude) { $a += '/XD'; $a += $Exclude }
+            & robocopy @a | Out-Null
+            # robocopy 的 0~7 都算成功，8 以上才是失败
+            if ($LASTEXITCODE -ge 8) { throw "robocopy 失败(exit $LASTEXITCODE): $Src" }
+            $global:LASTEXITCODE = 0
+          }
+
+          $pkg = 'C:\dbpkg'
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          # data/sql/old 没有被任何 updates_include 引用，跳过省 280MB
+          Copy-SqlTree 'C:\ac\data\sql' "$pkg\data\sql" @('C:\ac\data\sql\old')
+          # 首次建世界库用的 CoA 世界数据包，以及导入工具
+          Copy-SqlTree 'C:\ac\data\coa-world' "$pkg\data\coa-world"
+          Copy-SqlTree 'C:\ac\apps\coa-world' "$pkg\apps\coa-world"
+          # 每个模块的 data/sql（含 mod-playerbots 的 playerbots / world / characters）
+          foreach ($m in Get-ChildItem 'C:\ac\modules' -Directory) {
+            Copy-SqlTree (Join-Path $m.FullName 'data\sql') "$pkg\modules\$($m.Name)\data\sql"
+          }
+
+          # 把编译信息一起打进去：解压后先看这个文件，就知道该把本地源码对齐到哪个 commit
+          $info = 'C:\ac\env\dist\BUILD_INFO.txt'
+          if (Test-Path $info) { Copy-Item $info "$pkg\BUILD_INFO.txt" -Force }
+
+          $zip      = Join-Path $env:RUNNER_TEMP 'coa-db-source.zip'
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          Push-Location $pkg
+          if (Test-Path $sevenZip) {
+            & $sevenZip a -tzip -mx=5 -bso0 -bsp0 $zip 'data' 'apps' 'modules' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip 打包失败(exit $LASTEXITCODE)" }
+          } else {
+            Compress-Archive -Path 'data', 'apps', 'modules' -DestinationPath $zip -CompressionLevel Optimal
+          }
+          Pop-Location
+          $global:LASTEXITCODE = 0
+
+          "DB_PKG_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $info = Get-Item $zip
+          Write-Host ("数据库源目录已打包: {0:N1} MB" -f ($info.Length / 1MB))
+          $summary = @()
+          $summary += '### 数据库源目录'
+          $summary += ''
+          $summary += ('- coa-db-source-r{0}.zip（{1:N0} MB）：解压后把 worldserver.conf 里的 SourceDirectory 指向它，worldserver 就会自己更新数据库' -f ${{ github.run_number }}, ($info.Length / 1MB))
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -277,3 +483,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 6
+
+      - name: 上传数据库源目录
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-db-source-r${{ github.run_number }}
+          path: ${{ env.DB_PKG_ZIP }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
