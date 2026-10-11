@@ -5,22 +5,32 @@
 # Actions → Build CoA + Playerbots (Windows) → Run workflow
 # 已 Fork 的话【什么都不用填】，直接 Run：core_repo 留空即代表编译你自己的 fork
 # 产物：运行页面底部 Artifacts → coa-server-windows-rXX.zip
-#       最小包：authserver.exe + worldserver.exe + 几个运行时 DLL
-#       （+ BUILD_INFO.txt 版本凭据、MANIFEST.txt 清单与 SHA-256）
-#       不含 etc/ 配置模板和 startup 脚本 —— 本地源码里本来就有，没必要重复下载。
+#       最终包：authserver.exe + worldserver.exe + 运行时 DLL
+#       （libmysql / libcrypto-3-x64 / libssl-3-x64 / legacy / VC 运行库）
+#       配置模板、SQL、BUILD_INFO 等一律不打包 —— 本地源码里本来就有，
+#       没必要重复下载。
 #       另有一个可选的 coa-db-source-rXX.zip（约 240MB，数据库源目录），
 #       由输入项 db_source 控制，默认 no（本地已有源码就不需要）。
 #
-# 想确认"包到底传上去没有"：看运行摘要里的「Artifacts 上传结果」，
-# 有直链 + SHA-256 就是真上去了（最后一步会在拿不到 artifact-url 时直接报错）。
-# 产物保留 30 天；重跑（Re-run all jobs）不会因为重名而失败（overwrite: true）。
+# 想确认"包到底传上去没有"：看运行摘要里的「最终产物（authserver.exe + worldserver.exe + 运行时 DLL）」，
+# 有直链 + SHA-256 就是真上去了（最后一步在拿不到 artifact-url 时会直接报错）。
+#
+# ★ 工作流分成两个作业 —— 为的是「打包失败不用重新编译」：
+#     build   —— 编译（两小时上下），完事后把整个 env/dist 存成
+#                「编译原始产物」artifact（保留 7 天）
+#     package —— 取回那份原始产物，挑出两个 exe + 运行时 DLL 做最终包（几十秒）
+#   打包环节一旦出问题：运行页面右上角 Re-run jobs → **Re-run failed jobs**，
+#   只重跑 package 就行 —— 编译作业是成功的，不会重跑，它上传的 artifact
+#   在重跑中依然可用（GitHub 官方文档明文说明）。
+#   ⚠ 别点 "Re-run all jobs" —— 那个会把编译一起重来（又是两小时）。
 #
 # ★ 体积只打印、不做任何判断 —— 绝不因为 exe 小而拦下上传。
-#   一次误判的代价是"整个 job 失败 + 再等两小时全量编译"，比"万一传了个小包"严重得多。
-#   唯一的硬条件是 env/dist 里得有 exe（有存在性检查）。
+#   一次误判的代价是"作业失败 + 再等两小时全量编译"，比"万一传了个小包"严重得多。
+#   唯一的硬条件是 env/dist 里得有 exe。
 # ★ ccache 缓存是"失败也保存"的（restore/save 拆开 + !cancelled()），
 #   所以中间某步报错也不会把两小时的编译成果一起丢掉。
 #
+# 最终产物保留 30 天，编译原始产物保留 7 天。
 # 首次全量编译约 2~4 小时（4 核 runner），第二次起有 ccache 会快很多。
 # 想要快就用 build-linux.yml（约 40~70 分钟）。
 ##############################################################################
@@ -63,15 +73,17 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: coa-build-windows-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   build:
-    name: Windows build
+    name: build (编译)
     runs-on: windows-2022
     timeout-minutes: 355
+    # 同一分支不并发跑两次编译（免得两个两小时的任务同时占额度）。
+    # 特意放在 build 作业上、而不是 workflow 级 —— 免得把同一个 run 里的
+    # package 作业也卷进排队：package 只是几十秒的收尾活，不该受这个约束。
+    concurrency:
+      group: coa-build-windows-${{ github.ref }}
+      cancel-in-progress: false
 
     env:
       BOOST_ROOT: C:\local\boost_1_87_0
@@ -475,43 +487,8 @@ jobs:
 
       # ------------------------------------------------------------------
       # 5. 产物（Windows 下 exe 直接落在 env/dist/，配置在 env/dist/etc/）
+      #    最终包 = 两个 exe + 运行时 DLL；conf / SQL / startup 脚本不打包。
       # ------------------------------------------------------------------
-      # OpenSSL 是动态链接的（CCUSTOMOPTIONS 里 OPENSSL_USE_STATIC_LIBS=FALSE），
-      # 模块 README_COA.md 也明确要求把 libmysql.dll / libcrypto-3-x64.dll /
-      # libssl-3-x64.dll / legacy.dll 放到 worldserver.exe 旁边，这里全部补进产物目录，
-      # 并把每个 exe 的真实依赖列出来，方便排查"缺 dll 打不开"。
-      - name: 补齐运行时 DLL 并列出 exe 的依赖
-        shell: pwsh
-        run: |
-          $dist = 'C:\ac\env\dist'
-
-          $candidates = @(
-            'C:\openssl\bin\libcrypto*.dll',
-            'C:\openssl\bin\libssl*.dll',
-            'C:\openssl\bin\legacy.dll',
-            'C:\openssl\lib\ossl-modules\legacy.dll',
-            'C:\tools\mysql\current\bin\libmysql.dll',
-            'C:\tools\mysql\current\lib\libmysql.dll'
-          )
-
-          $copied = @()
-          foreach ($pattern in $candidates) {
-            foreach ($f in @(Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
-              Copy-Item $f.FullName $dist -Force
-              $copied += $f.Name
-              Write-Host "已拷贝 $($f.Name)"
-            }
-          }
-          if ($copied.Count -eq 0) { Write-Warning '一个候选 DLL 都没找到，产物里的 exe 可能缺依赖' }
-
-          foreach ($name in @('worldserver.exe','authserver.exe')) {
-            $exe = Join-Path $dist $name
-            if (Test-Path $exe) {
-              Write-Host "--- $name 依赖的 DLL ---"
-              & dumpbin /nologo /dependents $exe 2>$null | Select-String '\.dll'
-            }
-          }
-
       - name: 查看产物
         shell: bash
         working-directory: C:\ac
@@ -590,6 +567,85 @@ jobs:
           $lines | Out-File -FilePath $out -Encoding utf8
           Get-Content $out
 
+
+      # ------------------------------------------------------------------
+      # 5.6 补齐运行时 DLL：OpenSSL 因为 -DOPENSSL_USE_STATIC_LIBS=FALSE 是动态链接，
+      #     MySQL 客户端 libmysql.dll 也不在安装输出里 —— 编译器不会帮你拷，
+      #     缺了它们 exe 在别的机器上根本起不来。按候选来源找齐拷进 env/dist，
+      #     这样它们会随下面的原始产物一起交给 package 作业打最终包。
+      #     某个 DLL 找不到只警告、不拦截（别让一个 DLL 把两小时的编译废掉）。
+      # ------------------------------------------------------------------
+      - name: 补齐运行时 DLL（libmysql / OpenSSL / VC 运行库）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'C:\ac\env\dist'
+
+          # 各 DLL 的候选来源，按顺序取第一个命中的
+          $candidates = [ordered]@{
+            'libmysql.dll'       = @('C:\tools\mysql\current\lib', 'C:\tools\mysql\current\bin')
+            'libcrypto-3-x64.dll'= @('C:\openssl\bin', 'C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin', 'C:\Windows\System32')
+            'libssl-3-x64.dll'   = @('C:\openssl\bin', 'C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin', 'C:\Windows\System32')
+            'legacy.dll'         = @('C:\openssl\bin', 'C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')
+            'vcruntime140.dll'   = @('C:\Windows\System32')
+            'vcruntime140_1.dll' = @('C:\Windows\System32')
+            'msvcp140.dll'       = @('C:\Windows\System32')
+          }
+
+          foreach ($name in $candidates.Keys) {
+            if (Test-Path (Join-Path $dist $name)) { Write-Host "env/dist 已有 $name，跳过"; continue }
+            $src = @($candidates[$name]) |
+              Where-Object { Test-Path (Join-Path $_ $name) } |
+              Select-Object -First 1
+            if ($src) {
+              Copy-Item (Join-Path $src $name) $dist -Force
+              Write-Host ("拷入 {0}  <-  {1}" -f $name, (Join-Path $src $name))
+            } else {
+              Write-Warning "没找到 $name（只提醒不拦截，最终包会缺它）"
+            }
+          }
+
+          # 把两个 exe 的真实依赖打印出来，缺哪个 DLL 一目了然
+          if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+            foreach ($exe in @('worldserver.exe', 'authserver.exe')) {
+              $p = Join-Path $dist $exe
+              if (Test-Path $p) {
+                Write-Host "--- 依赖：$exe ---"
+                & dumpbin /DEPENDENTS $p 2>&1 |
+                  Select-String -Pattern '\.dll' |
+                  ForEach-Object { Write-Host ('    ' + $_.Line.Trim()) }
+              }
+            }
+          } else {
+            Write-Warning 'PATH 里没有 dumpbin，跳过依赖列表（不影响产物）'
+          }
+
+          Write-Host '--- env/dist 里的 DLL ---'
+          Get-ChildItem (Join-Path $dist '*.dll') -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      # ------------------------------------------------------------------
+      # 6.5 把编译原始产物（整个 env/dist）先存一份到 Artifacts
+      #     为什么多传这一份：下面「整理最终产物包」是另一个作业（package）在干，
+      #     它要是出了问题，点 Re-run failed jobs 就能只重跑它 —— 而它能重跑的前提
+      #     就是这里的原始产物还在。runner 是本作业跑完就销毁的临时机器，
+      #     编译成果不落成 artifact 就等于没有。
+      #     保留 7 天，够你慢慢折腾；最终交付包还是那个干净的最小包。
+      # ------------------------------------------------------------------
+      - name: 上传编译原始产物（重跑打包作业的前提）
+        id: upload_raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-raw-dist-r${{ github.run_number }}
+          path: C:\ac\env\dist
+          if-no-files-found: error
+          retention-days: 7
+          # exe 已经是压缩过的 PE 文件，再压收益很小，用最低档换速度
+          compression-level: 1
+          # 重跑本作业时会撞同名，必须覆盖（否则重跑直接挂在这一步）
+          overwrite: true
+
+
       # ------------------------------------------------------------------
       # 6. 数据库源目录：worldserver 启动时按它去找 SQL 做自动更新
       # ------------------------------------------------------------------
@@ -650,14 +706,107 @@ jobs:
           $summary += ('- coa-db-source-r{0}.zip（{1:N0} MB）：解压后把 worldserver.conf 里的 SourceDirectory 指向它，worldserver 就会自己更新数据库' -f ${{ github.run_number }}, ($info.Length / 1MB))
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
+      - name: 上传数据库源目录
+        if: ${{ inputs.db_source == 'yes' }}
+        id: upload_db
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-db-source-r${{ github.run_number }}
+          path: ${{ env.DB_PKG_ZIP }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: true
+
+      # 把编译阶段传上去的东西钉在摘要里。这两个包在重跑时都还在，
+      # package 作业正是靠 coa-raw-dist 干活。
+      - name: 记录编译阶段的上传结果
+        shell: pwsh
+        run: |
+          $lines = @('### 编译阶段产物', '')
+          $rawName = 'coa-raw-dist-r${{ github.run_number }}'
+          $rawUrl  = '${{ steps.upload_raw.outputs.artifact-url }}'
+          $rawDig  = '${{ steps.upload_raw.outputs.artifact-digest }}'
+
+          if ([string]::IsNullOrWhiteSpace($rawUrl)) {
+            $lines += '- ❌ **' + $rawName + '**：artifact-url 为空，没传上去'
+          } else {
+            $lines += '- ✅ **' + $rawName + '** —— 编译原始产物（供打包作业使用，7 天内请勿删除）'
+            $lines += '    - SHA-256: ' + $rawDig
+            $lines += '    - 下载: ' + $rawUrl
+          }
+
+          if ('${{ inputs.db_source }}' -eq 'yes') {
+            $dbName = 'coa-db-source-r${{ github.run_number }}'
+            $dbUrl  = '${{ steps.upload_db.outputs.artifact-url }}'
+            $dbDig  = '${{ steps.upload_db.outputs.artifact-digest }}'
+            if ([string]::IsNullOrWhiteSpace($dbUrl)) {
+              $lines += '- ❌ **' + $dbName + '**：artifact-url 为空，没传上去'
+            } else {
+              $lines += '- ✅ **' + $dbName + '**'
+              $lines += '    - SHA-256: ' + $dbDig
+              $lines += '    - 下载: ' + $dbUrl
+            }
+          }
+
+          $lines += @('', '> 接下来由 **package (打包)** 作业挑出两个 exe + 运行时 DLL 生成最终产物。')
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | Where-Object { $_ -ne '' } | ForEach-Object { Write-Host $_ }
+
+          if ([string]::IsNullOrWhiteSpace($rawUrl)) {
+            throw '编译原始产物没上传成功（拿不到 artifact-url），打包作业会没东西可用'
+          }
+          Write-Host '编译原始产物已确认上传成功。'
+
+
+
+  # ===========================================================================
+  # 打包作业：从编译作业的原始产物里挑出两个 exe 做成最终包（几十秒）。
+  #
+  # 单独拆出来就是为了解决「打包失败还要重新编译两小时」：
+  #   这一作业失败时，在运行页面右上角选 Re-run jobs → **Re-run failed jobs**，
+  #   只会重跑这一个作业；编译作业是成功的，不会重跑，它上传的 artifact
+  #   在重跑中也依然可用（GitHub 官方文档明文说明）。
+  #   ⚠ 别点 "Re-run all jobs" —— 那个会把编译一起重来。
+  # ===========================================================================
+  package:
+    name: package (打包，可单独重跑)
+    needs: build
+    runs-on: windows-2022
+    # 打包本身很快，给足余量即可；真卡住也不会占着 runner 一小时
+    timeout-minutes: 30
+    steps:
+      # 把编译作业传上来的原始产物取回来。同一个 run 内，用名字即可。
+      - name: 取回编译原始产物
+        uses: actions/download-artifact@v4
+        with:
+          name: coa-raw-dist-r${{ github.run_number }}
+          path: C:\ac\env\dist
+
+      - name: 确认取到的产物
+        shell: pwsh
+        run: |
+          Write-Host '--- 取回的 env/dist ---'
+          Get-ChildItem 'C:\ac\env\dist' -File |
+            Sort-Object Name | Select-Object Name, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+          foreach ($n in @('authserver.exe', 'worldserver.exe')) {
+            if (Test-Path (Join-Path 'C:\ac\env\dist' $n)) {
+              Write-Host "OK   $n"
+            } else {
+              Write-Warning "取回的产物里没有 $n（照常往下走，不加拦截）"
+            }
+          }
+
       # ------------------------------------------------------------------
-      # 7. 只打包"能跑起来的最小集合"
+      # 7. 打"能跑起来的最小集合"
       #     env/dist 里其实还有 etc/ 配置模板、acore.sh 拷进去的 startup 脚本等；
       #     本地既然留了一份源码当 SQL 源，这些模板就已经有了，不必再重复下几十 MB。
-      #     所以这里挑出 exe + 运行时 DLL（+ BUILD_INFO.txt）另存到 C:\ac\pkg，只上传它。
+      #     所以这里挑出 authserver.exe + worldserver.exe + 运行时 DLL
+      #     另存到 C:\ac\pkg，只上传它。
       #     想换回整包：把下面"上传产物"的 path 改回 C:\ac\env\dist 即可。
       # ------------------------------------------------------------------
-      - name: 整理最小产物包（两个 exe + 运行时 DLL）
+      - name: 整理最终产物包（两个 exe + 运行时 DLL）
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -674,61 +823,37 @@ jobs:
             Copy-Item $f $pkg -Force
           }
 
-          # 运行时 DLL 全部带上（libmysql / libcrypto-3-x64 / libssl-3-x64 / legacy 等）
-          # 找不到也只是警告，不拦上传 —— 不让任何"可能误判"的条件废掉两小时的编译。
+          # 运行时 DLL 全部带上（libmysql / libcrypto-3-x64 / libssl-3-x64 / legacy 等）；
+          # 一个都没有也只警告不拦截 —— 别让一个 DLL 把两小时的编译废掉
           $dlls = @(Get-ChildItem (Join-Path $dist '*.dll') -File -ErrorAction SilentlyContinue)
-          if ($dlls.Count -eq 0) { Write-Warning 'env/dist 里一个运行时 DLL 都没找到，照常上传，但 exe 可能起不来' }
-          $dlls | ForEach-Object { Copy-Item $_.FullName $pkg -Force }
-
-          # 三个 dll 缺了必然起不来，单独点名警告
-          foreach ($req in @('libmysql.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll')) {
-            if (-not (Test-Path (Join-Path $pkg $req))) { Write-Warning "缺少必需 DLL: $req" }
+          if ($dlls.Count -eq 0) {
+            Write-Warning 'env/dist 里一个运行时 DLL 都没有，最终包只有两个 exe（新机器上会缺库）'
+          } else {
+            $dlls | ForEach-Object { Copy-Item $_.FullName $pkg -Force }
           }
 
-          # 1KB 的版本凭据，用来把本地源码对齐到本次编译的 commit
-          $info = Join-Path $dist 'BUILD_INFO.txt'
-          if (Test-Path $info) { Copy-Item $info $pkg -Force }
+          $files = @(Get-ChildItem $pkg -File | Sort-Object Name)
 
-          # 体积只打印、不判断。
-          #   这里是给你"看一眼心里有数"用的，绝不因为体积拦下上传 ——
-          #   之前按"worldserver ≥ 20MB、authserver ≥ 5MB"做拦截，把正常的 authserver.exe
-          #   误判了（它只做账号认证，官方整合包实测也就 2.7 MB），而且 throw 会让整个
-          #   job 失败、连 ccache 缓存一起丢掉，白等两小时。教训记在这儿，别再往回加。
+          # 体积只打印、不判断（authserver.exe 本来就小，别设体积门槛误杀）
           foreach ($n in @('worldserver.exe', 'authserver.exe')) {
             $f = Get-Item (Join-Path $pkg $n)
             Write-Host ('{0,-18} {1,8:N2} MB' -f $f.Name, ($f.Length / 1MB))
           }
+          Write-Host ("包内 DLL 共 {0} 个：{1}" -f $dlls.Count, (($dlls | ForEach-Object Name) -join ', '))
 
-          # 清单 + SHA-256：以后核对"下载到的包对不对"不用猜
-          $files   = @(Get-ChildItem $pkg -File | Sort-Object Name)
-          $manifest = @('# 最小产物包清单', "# built_at = $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')", '')
-          foreach ($f in $files) {
-            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
-            $manifest += ('{0}`t{1:N0} bytes`t{2}' -f $f.Name, $f.Length, $h)
-          }
-          $manifest += @('', '用 PowerShell 校验下载到的文件：')
-          $manifest += '  Get-FileHash .\<文件名> -Algorithm SHA256'
-          $manifest | Out-File -FilePath (Join-Path $pkg 'MANIFEST.txt') -Encoding utf8
-          $files = @(Get-ChildItem $pkg -File | Sort-Object Name)
-
-          Write-Host '--- 最小产物包内容 ---'
-          $files | Select-Object Name, Length |
-            Format-Table -AutoSize | Out-String | Write-Host
-
-          $mb    = ($files | Measure-Object Length -Sum).Sum / 1MB
-          $exeMb = (@($files | Where-Object Extension -eq '.exe') | Measure-Object Length -Sum).Sum / 1MB
-          Write-Host ("合计 {0:N1} MB（其中 exe {1:N1} MB），共 {2} 个文件" -f $mb, $exeMb, $files.Count)
+          $mb = ($files | Measure-Object Length -Sum).Sum / 1MB
+          Write-Host ("共打包 {0} 个文件（2 个 exe + {1} 个 DLL），合计 {2:N2} MB" -f $files.Count, $dlls.Count, $mb)
 
           $summary = @(
             '### 最小产物包',
             '',
-            ('只含两个 exe + 运行时 DLL + BUILD_INFO.txt + MANIFEST.txt，合计 **{0:N1} MB**（exe {1:N1} MB），共 {2} 个文件' -f $mb, $exeMb, $files.Count),
+            ('含 **authserver.exe + worldserver.exe + 运行时 DLL**，共 **{0:N2} MB**，{1} 个文件' -f $mb, $files.Count),
             '',
             '| 文件 | 大小 |',
             '|---|---|'
           )
-          $summary += @($files | ForEach-Object { '| `{0}` | {1:N1} MB |' -f $_.Name, ($_.Length / 1MB) })
-          $summary += @('', 'SHA-256 见包内 `MANIFEST.txt`，下载后可用 `Get-FileHash` 核对。')
+          $summary += @($files | ForEach-Object { '| `{0}` | {1:N2} MB |' -f $_.Name, ($_.Length / 1MB) })
+          $summary += @('', '> 注意：本包不含配置文件。`worldserver.conf` / `authserver.conf` / `playerbots.conf` 要从本地源码复制（去掉 `.dist` 后缀），并修改 `SourceDirectory` / `MySQLExecutable` / `Updates.EnableDatabases` 三处。')
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: 上传产物
@@ -736,25 +861,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coa-server-windows-r${{ github.run_number }}
-          # 只传最小包 C:\ac\pkg（两个 exe + DLL）；要整包就改成 C:\ac\env\dist
+          # 只传最终包 C:\ac\pkg（两个 exe + DLL）；要整包就改成 C:\ac\env\dist
           path: C:\ac\pkg
           if-no-files-found: error
           retention-days: 30
-          compression-level: 6
+          # exe 已是压缩过的 PE，无需高压缩比，用低档换上传速度
+          compression-level: 1
           # 同一次运行里点 "Re-run all jobs" 会撞上同名 artifact，v4 默认直接失败。
           # 打开 overwrite 覆盖旧的，避免"好不容易跑完 2 小时，重跑却挂在上传这一步"。
-          overwrite: true
-
-      - name: 上传数据库源目录
-        if: ${{ inputs.db_source == 'yes' }}
-        id: upload_db
-        uses: actions/upload-artifact@v4
-        with:
-          name: coa-db-source-r${{ github.run_number }}
-          path: ${{ env.DB_PKG_ZIP }}
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
           overwrite: true
 
       # ★ 最后一步：把"到底传上去了什么"钉死在运行摘要里。
@@ -764,7 +878,7 @@ jobs:
       - name: 记录上传结果（Artifacts 链接与校验和）
         shell: pwsh
         run: |
-          $lines = @('### Artifacts 上传结果', '')
+          $lines = @('### 最终产物（authserver.exe + worldserver.exe + 运行时 DLL）', '')
           $name1 = 'coa-server-windows-r${{ github.run_number }}'
           $url1  = '${{ steps.upload_server.outputs.artifact-url }}'
           $dig1  = '${{ steps.upload_server.outputs.artifact-digest }}'
@@ -778,20 +892,6 @@ jobs:
             $lines += '    - 下载: ' + $url1
           }
 
-          if ('${{ inputs.db_source }}' -eq 'yes') {
-            $name2 = 'coa-db-source-r${{ github.run_number }}'
-            $url2  = '${{ steps.upload_db.outputs.artifact-url }}'
-            $dig2  = '${{ steps.upload_db.outputs.artifact-digest }}'
-            $id2   = '${{ steps.upload_db.outputs.artifact-id }}'
-            if ([string]::IsNullOrWhiteSpace($url2)) {
-              $lines += '- ❌ **' + $name2 + '**：artifact-url 为空'
-            } else {
-              $lines += '- ✅ **' + $name2 + '**（artifact id ' + $id2 + '）'
-              $lines += '    - SHA-256: ' + $dig2
-              $lines += '    - 下载: ' + $url2
-            }
-          }
-
           $lines += @('', '> 上面的链接就是该次运行的 Artifacts（需登录 GitHub 才能下载）。', '> 运行页面**最下方**的 Artifacts 区块里也能看到同名条目。')
           $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           $lines | Where-Object { $_ -ne '' } | ForEach-Object { Write-Host $_ }
@@ -799,4 +899,4 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($url1)) {
             throw '上传产物后没拿到 artifact-url，判定为上传失败（Artifacts 里不会有包）'
           }
-          Write-Host '主产物已确认上传成功。'
+          Write-Host '最终产物已确认上传成功。'
