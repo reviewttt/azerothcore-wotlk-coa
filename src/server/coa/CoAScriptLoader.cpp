@@ -53,6 +53,10 @@ void AddSC_CoAGameObjectScale();
 void AddSC_CoACreatureScaling();
 void AddSC_CoADungeonBossKit();
 void AddSC_CoADungeonNormal();
+void AddSC_CoAOtherSideMuzah();
+void AddSC_CoAOtherSideDrakmath();
+void AddSC_CoAOtherSideEmbryo();
+void AddSC_CoAOtherSideTrash();
 void AddSC_CoADungeonCompletion();
 void AddSC_CoADungeonSpoils();
 void AddSC_CoADungeonTuning();
@@ -380,6 +384,7 @@ void AddSC_AscensionRunemasterTalentProcs();
 void AddSC_AscensionRunemasterTalentMechanics();
 void AddSC_AscensionWelcomeWarchest();
 void AddSC_AscensionClassBundleStore();
+void AddSC_AscensionHeirloomWeaponStore();
 void AddSC_AscensionLfgObjective();
 void AddSC_AscensionBushcraft();
 
@@ -749,6 +754,10 @@ void AddCoAScripts()
     AddSC_CoACreatureScaling();
     AddSC_CoADungeonBossKit();
     AddSC_CoADungeonNormal();
+    AddSC_CoAOtherSideMuzah();
+    AddSC_CoAOtherSideDrakmath();
+    AddSC_CoAOtherSideEmbryo();
+    AddSC_CoAOtherSideTrash();
     AddSC_CoADungeonCompletion();
     AddSC_CoADungeonSpoils();
     AddSC_CoADungeonTuning();
@@ -764,6 +773,7 @@ void AddCoAScripts()
     AddSC_AscensionKeepersScrollZoneBuff();
     AddSC_AscensionWelcomeWarchest();
     AddSC_AscensionClassBundleStore();
+    AddSC_AscensionHeirloomWeaponStore();
     AddSC_AscensionLfgObjective();
     AddSC_AscensionBushcraft();
 }

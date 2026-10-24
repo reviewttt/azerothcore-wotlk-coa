@@ -6,6 +6,7 @@
 
 #include "AccountMgr.h"
 #include "AscensionFelsworn.h"
+#include "AscensionHighRiskPolicy.h"
 #include "AscensionItemScaling.h"
 #include "AscensionPyromancer.h"
 #include "AscensionCultist.h"
@@ -88,6 +89,7 @@
 #include "GlobalScript.h"
 #include "GroupScript.h"
 #include "GridTerrainData.h"
+#include "Guild.h"
 #include "GuildPackets.h"
 #include "Item.h"
 #include "ItemScript.h"
@@ -406,8 +408,13 @@ constexpr uint32 VANITY_CATEGORY_MOUNTS = 0x04000000;
 constexpr uint32 SPELL_TALENT_LEARNING_CUE = 47292;
 constexpr uint32 VANITY_CATEGORY_COMPANIONS = 0x08000000;
 constexpr uint32 VANITY_CATEGORY_CONSUMABLE = 0x40000000;
+constexpr uint32 ITEM_AURA_OF_EXPERIENCE = 818059;
+constexpr uint8 VANITY_REALM_LEVEL = 60;
 constexpr uint32 ITEM_WONDROUS_WISDOMBALL = 101169;
 constexpr uint32 ITEM_FIX_O_TRON_5000 = 97330;
+constexpr std::array<uint32, 18> BROKEN_COMPANION_SPELLS = {
+    83896, 84120, 84124, 84195, 84217, 84218, 84226, 84236, 84245,
+    84247, 84254, 84262, 84265, 84304, 84306, 84326, 103844, 354550};
 constexpr std::size_t COMPANION_SPELLS_PER_BATCH = 4;
 constexpr uint32 COMPANION_SPELL_BATCH_INTERVAL_MS = 200;
 
@@ -422,6 +429,14 @@ constexpr std::array<uint32, 9> BUSHCRAFT_CRAFTED_ITEMS =
 {
     10521, 10522, 10523, 10524, 10525, 10526, 10527, 10528, 1041704
 };
+
+constexpr std::array<uint32, 8> GOBLIN_SALVAGE_QUEST_ITEMS =
+{
+    9707001, 9707002, 9707003, 9707004, 9707005, 9707006, 9707007, 9707008
+};
+
+constexpr std::array<uint32, 2> GOBLIN_SALVAGE_FIELD_TESTING_QUESTS = { 176003, 176013 };
+constexpr float GOBLIN_SALVAGE_FIELD_TESTING_LOOT_REACH = 10.0f;
 
 enum AscensionRidingSpells : uint32
 {
@@ -1510,7 +1525,7 @@ public:
         {
             if (Player* owner = session->GetPlayer(); owner && ActiveSlot(owner) == slot)
             {
-                owner->LoadActions(result);
+                owner->LoadActions(result, false);
                 SynchronizeTalentReplacements(owner);
                 owner->SendInitialActionButtons();
             }
@@ -2056,6 +2071,21 @@ public:
             proposed.Entries.push_back({ entryId, rank });
     std::vector<AscensionCoATalentState::KnownEntry> const proposedKnown =
         AscensionCoATalentState::SlotKnownEntries(proposed, player->GetLevel(), CarriedSpells(player));
+    for (AscensionCoATalentState::KnownEntry const& item : upload)
+    {
+        AscensionCompatData::CoATalentEntry const* entry = FindTalentEntry(item.EntryId);
+        if (!item.Rank || entry->AECost || entry->TECost || GetSelectableFreeGroup(entry->EntryId) ||
+            CanGrantAutomaticEntry(player, *entry, targetSpec) ||
+            std::any_of(proposedKnown.begin(), proposedKnown.end(),
+                [&item](AscensionCoATalentState::KnownEntry const& known)
+                {
+                    return known.EntryId == item.EntryId && known.Rank;
+                }))
+            continue;
+        refusal = { "CA_UPDATE_ENTRIES_BAD_ENTRY", "CA_LEARN_BAD_ABILITY", item.EntryId, item.Rank,
+                    Acore::StringFormat("Talent entry {} is not purchasable and cannot be granted automatically.", item.EntryId) };
+        return false;
+    }
     for (AscensionCoATalentState::KnownEntry const& item : priced)
     {
         AscensionCompatData::CoATalentEntry const* entry = FindTalentEntry(item.EntryId);
@@ -4020,6 +4050,9 @@ public:
              rows.Items.size(), sentSpells, rows.SuperTracks.size(), rows.QuestSuperTracks.size(),
              rows.SkillLineAbilities.size(), rows.ShapeshiftForms.size(), rows.VanityCollections.size(), bytes,
              player->GetName(), GetMSTimeDiffToNow(startTime));
+
+    if (!rows.ShapeshiftForms.empty() && player->GetShapeshiftForm() != FORM_NONE)
+      player->ForceValuesUpdateAtIndex(UNIT_FIELD_BYTES_2);
   }
 
 private:
@@ -4102,9 +4135,11 @@ private:
       SPELL_TOOLTIP_FIELD};
   static constexpr std::size_t SPELL_WIRE_DESCRIPTION = 1;
   static constexpr std::size_t SPELL_WIRE_TOOLTIP = 3;
+  static constexpr uint32 SPELL_CATEGORY_FIELD = 1;
   static constexpr uint32 SPELL_CASTER_AURA_SPELL_FIELD = 24;
   static constexpr uint32 SPELL_EXCLUDE_CASTER_AURA_SPELL_FIELD = 26;
   static constexpr uint32 SPELL_CAST_TIME_INDEX_FIELD = 28;
+  static constexpr uint32 SPELL_CATEGORY_RECOVERY_TIME_FIELD = 30;
   static constexpr uint32 SPELL_INTERRUPT_FLAGS_FIELD = 31;
   static constexpr uint32 SPELL_FAMILY_NAME_FIELD = 208;
   static constexpr std::array<uint32, 18> RANGED_PREPARATION_CLIENT_SPELLS = {
@@ -4988,6 +5023,12 @@ private:
     }
     if (info->Id == AscensionSunCleric::Dawn)
       row.Values[4] = info->Attributes;
+    if (info->Id == 805027 ||
+        (info->Id >= 807938 && info->Id <= 807941))
+    {
+      row.Values[SPELL_WIRE_SLOT(SPELL_CATEGORY_FIELD)] = 0;
+      row.Values[SPELL_WIRE_SLOT(SPELL_CATEGORY_RECOVERY_TIME_FIELD)] = 0;
+    }
     if (IsChromaticShardRank(info->Id))
       row.Values[SPELL_WIRE_SLOT(SPELL_INTERRUPT_FLAGS_FIELD)] &= ~uint32(SPELL_INTERRUPT_FLAG_MOVEMENT);
 
@@ -5063,7 +5104,8 @@ private:
     std::unordered_set<uint32> descriptionIds;
     for (uint32 const spellId : RANGED_PREPARATION_CLIENT_SPELLS)
       Ascension::ClientSpellPatches::Instance().Register(spellId);
-    for (uint32 const spellId : {801292u, 501836u, 501837u, 501838u, 501839u, 501840u, 574346u, 567543u, 567544u})
+    for (uint32 const spellId : {801292u, 501836u, 501837u, 501838u, 501839u, 501840u, 574346u, 567543u, 567544u,
+        805027u, 807938u, 807939u, 807940u, 807941u})
       Ascension::ClientSpellPatches::Instance().Register(spellId);
     std::unordered_set<uint32> requested = Ascension::ClientSpellPatches::Instance().GetIds(true);
     for (auto const& tier : blacksmithingTiers)
@@ -5271,8 +5313,19 @@ private:
   BuildDisplayPatchRows(std::filesystem::path const &clientDbcDirectory) const {
     std::filesystem::path const clientDbc =
         clientDbcDirectory / "CreatureDisplayInfo.dbc";
-    std::optional<std::unordered_set<uint32>> const clientDisplayIds =
+    std::optional<std::unordered_set<uint32>> clientDisplayIds =
         LoadDbcIds(clientDbc, 16);
+    if (!clientDisplayIds)
+    {
+      std::filesystem::path const serverDbc =
+          std::filesystem::path(sWorld->GetDataPath()) / "dbc" / "CreatureDisplayInfo.dbc";
+      clientDisplayIds = LoadDbcIds(serverDbc, 16);
+      if (clientDisplayIds)
+        LOG_INFO("coa",
+                 "Client DBC copy {} is unavailable; streaming the display ids "
+                 "missing from the server's own {}",
+                 clientDbc.generic_string(), serverDbc.generic_string());
+    }
     bool const haveClientSet = clientDisplayIds.has_value();
     if (!haveClientSet)
     {
@@ -5768,7 +5821,7 @@ public:
         {
             Creature* c = player->GetMap()->GetCreature(player->GetCritterGUID());
             isLootbot = c && c->IsAlive() && c->GetOwnerGUID() == player->GetGUID() &&
-                        c->GetEntry() == CREATURE_LOOTBOT_3000;
+                        c->GetEntry() == CREATURE_LOOTBOT_3000 && !player->GetMap()->IsRaid();
         }
 
         if (!hasAppearance && !isLootbot)
@@ -5790,10 +5843,18 @@ public:
         float const radius = spell->Effects[EFFECT_0].CalcRadius(player);
         if (radius <= 0.0f)
             return;
+        bool const fieldTesting = !skin && IsGoblinSalvageFieldTesting(player);
         std::list<Creature*> corpses;
         companion->GetDeadCreatureListInGrid(corpses, radius, true);
         for (Creature* creature : corpses)
-            player->LootCreatureWithCompanion(creature, radius, skin);
+            if (!fieldTesting || player->IsWithinDistInMap(creature, GOBLIN_SALVAGE_FIELD_TESTING_LOOT_REACH))
+                player->LootCreatureWithCompanion(creature, radius, skin);
+    }
+
+    [[nodiscard]] static bool IsGoblinSalvageFieldTesting(Player const* player)
+    {
+        return std::any_of(GOBLIN_SALVAGE_FIELD_TESTING_QUESTS.begin(), GOBLIN_SALVAGE_FIELD_TESTING_QUESTS.end(),
+            [player](uint32 questId) { return player->FindQuestSlot(questId) < MAX_QUEST_LOG_SIZE; });
     }
 
     void InitializeRiding(Player* player) const
@@ -5851,6 +5912,30 @@ public:
     {
         return !AscensionFreepick::RealmOffersMysticAltars() &&
             std::find(MysticAltarVanityItems.begin(), MysticAltarVanityItems.end(), itemId) != MysticAltarVanityItems.end();
+    }
+
+    [[nodiscard]] static bool IsBrokenCompanionSpell(uint32 spellId)
+    {
+        return std::binary_search(BROKEN_COMPANION_SPELLS.begin(), BROKEN_COMPANION_SPELLS.end(), spellId);
+    }
+
+    [[nodiscard]] bool IsUnsummonableCompanion(uint32 itemId) const
+    {
+        auto const vanity = _vanityItems.find(itemId);
+        if (vanity != _vanityItems.end() && IsBrokenCompanionSpell(vanity->second.LearnedSpell))
+            return true;
+        if (vanity == _vanityItems.end() || !vanity->second.LearnedSpell ||
+            !(vanity->second.CategoryMask & VANITY_CATEGORY_COMPANIONS))
+            return false;
+
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(vanity->second.LearnedSpell);
+        if (!spell)
+            return false;
+
+        for (SpellEffectInfo const& effect : spell->Effects)
+            if (effect.Effect == SPELL_EFFECT_SUMMON && !sObjectMgr->GetCreatureTemplate(effect.MiscValue))
+                return true;
+        return false;
     }
 
     [[nodiscard]] bool OwnsBankVanityItem(Player* player, PlayerCollectionState const& state, uint32 itemId) const
@@ -5945,6 +6030,7 @@ public:
                     AscensionCollectibles::SigilSpells.end(), vanity.LearnedSpell) &&
                     !state.OwnedVanityItems.contains(itemId)) ||
                 !vanity.LearnedSpell || player->HasSpell(vanity.LearnedSpell) ||
+                IsBrokenCompanionSpell(vanity.LearnedSpell) ||
                 !sSpellMgr->GetSpellInfo(vanity.LearnedSpell))
                 continue;
 
@@ -6270,8 +6356,11 @@ public:
         return;
     }
 
-    if (sObjectMgr->GetItemTemplate(itemId))
+    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId))
     {
+      if (RefuseWithoutVanityRealmLevel(player, proto))
+        return;
+
       ItemPosCountVec destinations;
       InventoryResult result =
           player->CanStoreNewItem(NULL_BAG, NULL_SLOT, destinations, itemId, 1);
@@ -6320,9 +6409,15 @@ public:
       return false;
 
     std::size_t vanityBefore = state->OwnedVanityItems.size();
+    std::size_t unsummonable = 0;
     for (uint32 itemId : _allVanityItemIds) {
       if (IsWithheldVanityItem(itemId))
         continue;
+
+      if (IsUnsummonableCompanion(itemId)) {
+        ++unsummonable;
+        continue;
+      }
 
       if (state->OwnedVanityItems.insert(itemId).second) {
         CharacterDatabasePreparedStatement *stmt =
@@ -6339,11 +6434,38 @@ public:
 
     LOG_INFO("coa",
              "Granted full Ascension vanity collection to {} (account {}): "
-             "+{} vanity items",
+             "+{} vanity items, {} companions without a creature skipped",
              player->GetName(), state->AccountId,
-             state->OwnedVanityItems.size() - vanityBefore);
+             state->OwnedVanityItems.size() - vanityBefore, unsummonable);
     return true;
   }
+
+    [[nodiscard]] bool RequiresVanityRealmLevel(ItemTemplate const* proto) const
+    {
+        return proto->ItemId == ITEM_AURA_OF_EXPERIENCE ||
+            (proto->Quality == ITEM_QUALITY_HEIRLOOM && _vanityItems.contains(proto->ItemId));
+    }
+
+    static bool AccountHasVanityRealmLevel(Player* player)
+    {
+        if (player->GetLevel() >= VANITY_REALM_LEVEL)
+            return true;
+
+        return CharacterDatabase.Query(
+            "SELECT 1 FROM `characters` WHERE `account` = {} AND `guid` <> {} AND `level` >= {} LIMIT 1",
+            player->GetSession()->GetAccountId(), player->GetGUID().GetCounter(), VANITY_REALM_LEVEL) != nullptr;
+    }
+
+    bool RefuseWithoutVanityRealmLevel(Player* player, ItemTemplate const* proto) const
+    {
+        if (!RequiresVanityRealmLevel(proto) || AccountHasVanityRealmLevel(player))
+            return false;
+
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            "This item requires you to have a level {} on this realm to be able to {}.", VANITY_REALM_LEVEL,
+            proto->Class == ITEM_CLASS_CONSUMABLE ? "consume" : "use");
+        return true;
+    }
 
   bool GrantMysticAltarVanityItems(Player *player) {
     std::shared_ptr<PlayerCollectionState> state = GetState(player);
@@ -8541,13 +8663,23 @@ class AscensionCompatPlayerScript : public PlayerScript {
             player->RemoveAurasDueToSpell(818059);
     }
 
+    static bool CanUseVanityRealmLevelItem(Player* player, Item* item, uint8 castCount)
+    {
+        if (!AscensionCollectionService::Instance().RefuseWithoutVanityRealmLevel(player, item->GetTemplate()))
+            return true;
+
+        if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(item->GetTemplate()->Spells[0].SpellId))
+            Spell::SendCastResult(player, spellInfo, castCount, SPELL_FAILED_DONT_REPORT);
+        return false;
+    }
+
 public:
   AscensionCompatPlayerScript()
       : PlayerScript(
             "AscensionCompatPlayerScript",
             {PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_UPDATE, PLAYERHOOK_ON_SAVE,
              PLAYERHOOK_ON_AFTER_SET_VISIBLE_ITEM_SLOT, PLAYERHOOK_ON_EQUIP, PLAYERHOOK_ON_DELETE,
-             PLAYERHOOK_ON_TAKE_MAIL_ITEM, PLAYERHOOK_CAN_CAST_ITEM_USE_SPELL,
+             PLAYERHOOK_ON_TAKE_MAIL_ITEM, PLAYERHOOK_CAN_CAST_ITEM_USE_SPELL, PLAYERHOOK_CAN_EQUIP_ITEM,
              PLAYERHOOK_ON_STORE_NEW_ITEM, PLAYERHOOK_ON_CREATE_ITEM,
              PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
              PLAYERHOOK_ON_PLAYER_IS_CLASS, PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_MAP_CHANGED,
@@ -8887,9 +9019,17 @@ public:
       ReconcileAscensionPrimalistWeapon(player);
   }
 
-  bool OnPlayerCanCastItemUseSpell(Player *player, Item *item, SpellCastTargets const &, uint8, uint32) override {
+  bool OnPlayerCanCastItemUseSpell(Player *player, Item *item, SpellCastTargets const &, uint8 castCount,
+                                   uint32) override {
     AscensionCollectionService::Instance().OnItemObtained(player, item);
-    return true;
+    return !ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED) ||
+           CanUseVanityRealmLevelItem(player, item, castCount);
+  }
+
+  bool OnPlayerCanEquipItem(Player* player, uint8, uint16&, Item* item, bool, bool notLoading) override
+  {
+      return !notLoading || !ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED) ||
+          !AscensionCollectionService::Instance().RefuseWithoutVanityRealmLevel(player, item->GetTemplate());
   }
 
     void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
@@ -9231,6 +9371,13 @@ public:
                     if (spellInfo->Effects[EFFECT_0].Effect == SPELL_EFFECT_APPLY_AURA &&
                         spellInfo->Effects[EFFECT_0].ApplyAuraName == SPELL_AURA_NONE)
                         spellInfo->Effects[EFFECT_0].ApplyAuraName = SPELL_AURA_DUMMY;
+                    break;
+                case 40120:
+                    spellInfo->AttributesEx4 |= SPELL_ATTR4_ONLY_FLYING_AREAS;
+                    break;
+                case 83086:
+                case 9930889:
+                    spellInfo->AttributesEx6 |= SPELL_ATTR6_NOT_IN_RAID_INSTANCES;
                     break;
                 default:
                     break;
@@ -9947,10 +10094,97 @@ class spell_ascension_experience_potion : public SpellScript
             }
     }
 
+    SpellCastResult CheckAltCharacter()
+    {
+        Player* player = GetCaster()->ToPlayer();
+        if (!player->HasSpell(SPELL_RESILIENT_CONSTITUTION) || AccountHasHigherLevelCharacter(player))
+            return SPELL_CAST_OK;
+
+        ChatHandler(player->GetSession()).SendSysMessage(
+            "This item can only be used on alt characters who are not the highest level on your account.");
+        return SPELL_FAILED_DONT_REPORT;
+    }
+
+    static bool AccountHasHigherLevelCharacter(Player* player)
+    {
+        return CharacterDatabase.Query(
+            "SELECT 1 FROM `characters` WHERE `account` = {} AND `guid` <> {} AND `level` > {} LIMIT 1",
+            player->GetSession()->GetAccountId(), player->GetGUID().GetCounter(), player->GetLevel()) != nullptr;
+    }
+
+    static constexpr uint32 SPELL_RESILIENT_CONSTITUTION = 552011;
+
     void Register() override
     {
+        OnCheckCast += SpellCheckCastFn(spell_ascension_experience_potion::CheckAltCharacter);
         BeforeHit += BeforeSpellHitFn(spell_ascension_experience_potion::SnapshotDuration);
         AfterHit += SpellHitFn(spell_ascension_experience_potion::ExtendDuration);
+    }
+};
+
+class spell_ascension_vanity_use_restriction : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_vanity_use_restriction);
+
+    static constexpr uint32 SPELL_BANNER_OF_RECRUITMENT = 100706;
+    static constexpr uint32 SPELL_SUMMON_PORTABLE_TRANSPOLYPORTER = 979611;
+    static constexpr uint32 SPELL_PORTABLE_TRANSPOLYPORTER_TELEPORT = 979612;
+
+    bool Load() override
+    {
+        return ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED) && GetCaster()->IsPlayer();
+    }
+
+    std::string_view Refusal(Player* player)
+    {
+        switch (GetSpellInfo()->Id)
+        {
+            case SPELL_BANNER_OF_RECRUITMENT:
+                return player->GetGuildId() && player->GetRank() <= GR_OFFICER ? std::string_view{}
+                    : "Only usable as Guild Master or Officer.";
+            case SPELL_SUMMON_PORTABLE_TRANSPOLYPORTER:
+            case SPELL_PORTABLE_TRANSPOLYPORTER_TELEPORT:
+                return player->HasAura(HighRisk::HighRiskAura) ? "Cannot be used by High-Risk players."
+                    : std::string_view{};
+            default:
+                return player->GetMap()->IsDungeon() ? "Can only be used on continents and in battlegrounds."
+                    : std::string_view{};
+        }
+    }
+
+    SpellCastResult CheckCast()
+    {
+        Player* player = GetCaster()->ToPlayer();
+        std::string_view const refusal = Refusal(player);
+        if (refusal.empty())
+            return SPELL_CAST_OK;
+
+        ChatHandler(player->GetSession()).SendSysMessage(refusal);
+        return SPELL_FAILED_DONT_REPORT;
+    }
+
+    void Register() override
+    {
+        OnCheckCast += SpellCheckCastFn(spell_ascension_vanity_use_restriction::CheckCast);
+    }
+};
+
+class spell_ascension_stick_on_a_carrot : public AuraScript
+{
+    PrepareAuraScript(spell_ascension_stick_on_a_carrot);
+
+    static constexpr uint8 HIGHEST_EFFECTIVE_LEVEL = 70;
+
+    void CalculateAmount(AuraEffect const*, int32& amount, bool&)
+    {
+        if (GetUnitOwner()->GetLevel() > HIGHEST_EFFECTIVE_LEVEL)
+            amount = 0;
+    }
+
+    void Register() override
+    {
+        DoEffectCalcAmount += AuraEffectCalcAmountFn(spell_ascension_stick_on_a_carrot::CalculateAmount, EFFECT_ALL,
+            SPELL_AURA_ANY);
     }
 };
 
@@ -10253,6 +10487,8 @@ void AddAscensionCompatScripts() {
   Ascension::ClientItemPatches::Instance().Register(ITEM_RED_RIBBONED_WRAPPING_PAPER);
   for (uint32 itemId : BUSHCRAFT_CRAFTED_ITEMS)
     Ascension::ClientItemPatches::Instance().Register(itemId);
+  for (uint32 itemId : GOBLIN_SALVAGE_QUEST_ITEMS)
+    Ascension::ClientItemPatches::Instance().Register(itemId);
   RegisterAscensionClientConfig([](AscensionClientConfig& config) {
     config.Booleans.emplace_back("CONFIG_CHARACTER_ADVANCEMENT_BUILD_INSPECT_ENABLED", true);
     config.Booleans.emplace_back("CONFIG_THROWN_WEAPON_APPEARANCES_ENABLED",
@@ -10262,6 +10498,8 @@ void AddAscensionCompatScripts() {
   new npc_ascension_training_book();
   RegisterSpellScript(spell_ascension_personal_bank);
   RegisterSpellScript(spell_ascension_experience_potion);
+  RegisterSpellScript(spell_ascension_vanity_use_restriction);
+  RegisterSpellScript(spell_ascension_stick_on_a_carrot);
   RegisterSpellScript(spell_ascension_local_mount);
   RegisterSpellScript(spell_ascension_specialization_slot);
   RegisterSpellScript(spell_ascension_jailers_bargain);
